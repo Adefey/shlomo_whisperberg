@@ -4,13 +4,15 @@ import logging
 import os
 import sys
 from datetime import datetime
+from typing import Any
 
 import torch
 import torchaudio
 from fastapi import FastAPI, HTTPException, UploadFile, status
-from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 from pydantic import BaseModel
+
+import whisper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,7 +45,7 @@ class DialogModel(BaseModel):
 TARGET_SAMPLE_RATE = 16000
 
 DIARIZATION_MODEL: Pipeline | None = None
-WHISPER_MODEL: WhisperModel | None = None
+WHISPER_MODEL: Any | None = None
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 DEVICE = os.environ.get("DEVICE", "cpu")
@@ -57,10 +59,10 @@ def load_model():
     DIARIZATION_MODEL.to(torch.device(DEVICE))
     logger.info(f"Loaded {diarization_checkpoint} on {DEVICE}")
 
-    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "Systran/faster-whisper-small")
+    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "openai/whisper-base")
     global WHISPER_MODEL
     logger.info(f"Loading {whisper_checkpoint}")
-    WHISPER_MODEL = WhisperModel(whisper_checkpoint, DEVICE)
+    WHISPER_MODEL = whisper.load_model(whisper_checkpoint, DEVICE)
     logger.info(f"Loaded {whisper_checkpoint} on {DEVICE}")
 
 
@@ -129,10 +131,10 @@ def combine_transcription_and_diarization(transcription: list, diarization: list
     turns = [[] for _ in range(len(diarization))]
 
     for word in transcription:
-        word_mid_time = (word.start + word.end) / 2
+        word_mid_time = (word["start"] + word["end"]) / 2
         for i in range(len(diarization)):
             if word_mid_time >= diarization[i][0] and word_mid_time < diarization[i][1]:
-                turns[i].append(word.word)
+                turns[i].append(word["word"])
                 break
 
     turns = [" ".join(turn) for turn in turns]
@@ -166,12 +168,14 @@ def transcribe(audio_file: UploadFile):
 
     logger.info(f"Start transctibing and diarization on {DEVICE}")
     whisper_waveform = waveform.squeeze().numpy().astype("float32")
-    whisper_output, whisper_info = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True, vad_filter=True)
+    whisper_output = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True)
+
     words = []
-    for segment in whisper_output:
-        for word in segment.words:
-            words.append(word)
-    logger.debug(f"Done transcribe: {words=}")
+    for segment in whisper_output["segments"]:
+        if "words" in segment:  # проверка, что слова есть
+            for word in segment["words"]:
+                words.append(word)
+    logger.debug(f"Done transcribe: {words=} {whisper_output['language']=}")
 
     diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
     diarization = list(diarization_output.exclusive_speaker_diarization)

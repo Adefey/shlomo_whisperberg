@@ -1,5 +1,5 @@
 fastapi
-faster_whisper
+openai-whisper
 pyannote-audio
 pydantic
 python-multipart
