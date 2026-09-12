@@ -54,18 +54,20 @@ DIARIZATION_DEVICE = os.environ.get("DIARIZATION_DEVICE", "cpu")
 
 
 def load_model():
+    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "openai/whisper-small")
+    global WHISPER_MODEL
+    logger.info(f"Loading {whisper_checkpoint}")
+    WHISPER_MODEL = whisper.load_model(whisper_checkpoint, WHISPER_DEVICE)
+    DIARIZATION_MODEL.segmentation_batch_size = 8
+    DIARIZATION_MODEL.embedding_batch_size = 8
+    logger.info(f"Loaded {whisper_checkpoint} on {WHISPER_DEVICE}")
+
     diarization_checkpoint = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
     global DIARIZATION_MODEL
     logger.info(f"Loading {diarization_checkpoint}")
     DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, use_auth_token=HF_TOKEN)
     DIARIZATION_MODEL.to(torch.device(DIARIZATION_DEVICE))
     logger.info(f"Loaded {diarization_checkpoint} on {DIARIZATION_DEVICE}")
-
-    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "openai/whisper-small")
-    global WHISPER_MODEL
-    logger.info(f"Loading {whisper_checkpoint}")
-    WHISPER_MODEL = whisper.load_model(whisper_checkpoint, WHISPER_DEVICE)
-    logger.info(f"Loaded {whisper_checkpoint} on {WHISPER_DEVICE}")
 
 
 def unload_model():
@@ -182,6 +184,8 @@ def transcribe(audio_file: UploadFile):
     # Cleanup
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    logger.info("Transcription is ready. Diarization in progress...")
 
     diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
     diarization = [(segment, label) for segment, _, label in diarization_output.itertracks(yield_label=True)]
