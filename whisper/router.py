@@ -48,7 +48,9 @@ DIARIZATION_MODEL: Pipeline | None = None
 WHISPER_MODEL: Any | None = None
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
-DEVICE = os.environ.get("DEVICE", "cpu")
+
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
+DIARIZATION_DEVICE = os.environ.get("DIARIZATION_DEVICE", "cpu")
 
 
 def load_model():
@@ -56,14 +58,14 @@ def load_model():
     global DIARIZATION_MODEL
     logger.info(f"Loading {diarization_checkpoint}")
     DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, use_auth_token=HF_TOKEN)
-    DIARIZATION_MODEL.to(torch.device(DEVICE))
-    logger.info(f"Loaded {diarization_checkpoint} on {DEVICE}")
+    DIARIZATION_MODEL.to(torch.device(DIARIZATION_DEVICE))
+    logger.info(f"Loaded {diarization_checkpoint} on {DIARIZATION_DEVICE}")
 
-    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "openai/whisper-base")
+    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "openai/whisper-small")
     global WHISPER_MODEL
     logger.info(f"Loading {whisper_checkpoint}")
-    WHISPER_MODEL = whisper.load_model(whisper_checkpoint, DEVICE)
-    logger.info(f"Loaded {whisper_checkpoint} on {DEVICE}")
+    WHISPER_MODEL = whisper.load_model(whisper_checkpoint, WHISPER_DEVICE)
+    logger.info(f"Loaded {whisper_checkpoint} on {WHISPER_DEVICE}")
 
 
 def unload_model():
@@ -88,7 +90,7 @@ app = FastAPI(
     title="Shlomo Whisperberg",
     description="Dialog recognition service",
     lifespan=lifespan,
-    version="12-09-2026",
+    version="13-09-2026",
 )
 
 
@@ -166,7 +168,7 @@ def transcribe(audio_file: UploadFile):
 
     # Call models one by one to reduce peak memory/compute usage
 
-    logger.info(f"Start transctibing and diarization on {DEVICE}")
+    logger.info(f"Start transctibing and diarization on {WHISPER_DEVICE} + {DIARIZATION_DEVICE}")
     whisper_waveform = waveform.squeeze().numpy().astype("float32")
     whisper_output = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True)
 
@@ -177,10 +179,19 @@ def transcribe(audio_file: UploadFile):
                 words.append(word)
     logger.debug(f"Done transcribe: {words=} {whisper_output['language']=}")
 
+    # Cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
     diarization = [(segment, label) for segment, _, label in diarization_output.itertracks(yield_label=True)]
     logger.debug(f"Done diarization: {diarization=}")
-    logger.info(f"Done transctibing and diarization on {DEVICE}")
+
+    # Cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info(f"Done transctibing and diarization on {WHISPER_DEVICE} + {DIARIZATION_DEVICE}")
 
     logger.info("Start constructing dialog from models' output")
     lines = combine_transcription_and_diarization(words, diarization)
@@ -194,5 +205,9 @@ def transcribe(audio_file: UploadFile):
             turns.append(turn)
 
     logger.info(f"Done constructing dialog from models' output, total turns: {len(turns)}")
+
+    # Cleanup
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return DialogModel(turns=turns)
