@@ -1,21 +1,24 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, status
-from pyannote.audio import Pipeline
+import gc
+import io
+import logging
 import os
-from pydantic import BaseModel
+import sys
+from datetime import datetime
+from typing import Iterable
+
 import torch
 import torchaudio
-import io
-import gc
-import logging
-from datetime import datetime
-import sys
+from fastapi import FastAPI, HTTPException, UploadFile, status
+from faster_whisper import WhisperModel
+from pyannote.audio import Pipeline
+from pydantic import BaseModel
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        logging.FileHandler(filename=f'logs/embedding_service_{datetime.now().strftime("%y_%m_%d_%H:%M:%S")}.log'),
+        logging.FileHandler(filename=f'logs/embedding_service_{datetime.now().strftime("%y_%m_%d_%H-%M-%S")}.log'),
         logging.StreamHandler(stream=sys.stdout),
     ],
 )
@@ -23,39 +26,57 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class DialogTurnModel(BaseModel):
+    speaker: str
+    turn_start: float
+    turn_end: float
+    line: str = ""
+
+
 class DialogModel(BaseModel):
     """
     Dialog contains list of lines
     """
 
-    lines: list[str]
+    turns: list[DialogTurnModel]
 
 
 TARGET_SAMPLE_RATE = 16000
 
-model: Pipeline | None = None
+DIARIZATION_MODEL: Pipeline | None = None
+WHISPER_MODEL: WhisperModel | None = None
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
+DEVICE = os.environ.get("DEVICE", "cpu")
+
+MAX_WORDS_IN_TURN = 2048
 
 
 def load_model():
+    diarization_checkpoint = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
+    global DIARIZATION_MODEL
+    logger.info(f"Loading {diarization_checkpoint} with {HF_TOKEN[:8]=}")
+    DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, token=HF_TOKEN)
+    DIARIZATION_MODEL.to(torch.device(DEVICE))
+    logger.info(f"Loaded {diarization_checkpoint} on {DEVICE}")
 
-    checkpoint = os.environ.get("MODEL", "pyannote/speaker-diarization-community-1")
-    hf_token = os.environ.get("HF_TOKEN")
-    device = os.environ.get("DEVICE", "cpu")
-    global model
-    logger.info(f"Loading {checkpoint} with token {hf_token}")
-    model = Pipeline.from_pretrained(checkpoint, token=hf_token)
-    model.to(torch.device(device))
-    logger.info(f"Loaded {checkpoint} on {device}")
+    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "Systran/faster-whisper-small")
+    global WHISPER_MODEL
+    logger.info(f"Loading {whisper_checkpoint} with {HF_TOKEN[:8]=}")
+    WHISPER_MODEL = WhisperModel(whisper_checkpoint, DEVICE)
+    logger.info(f"Loaded {whisper_checkpoint} on {DEVICE}")
 
 
 def unload_model():
-    global model
-    logger.info("Unloading model")
-    model = None
+    global DIARIZATION_MODEL
+    global WHISPER_MODEL
+    logger.info("Unloading models")
+    DIARIZATION_MODEL = None
+    WHISPER_MODEL = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    logger.info("Unloaded model")
+    logger.info("Unloaded models")
 
 
 def lifespan(app: FastAPI):
@@ -64,7 +85,50 @@ def lifespan(app: FastAPI):
     unload_model()
 
 
-app = FastAPI(title="Shlomo Whisperberg", description="Dialog recognition service", lifespan=lifespan)
+app = FastAPI(
+    title="Shlomo Whisperberg",
+    description="Dialog recognition service",
+    lifespan=lifespan,
+    version="12-09-2026",
+)
+
+
+def preprocess_audio(file_bytes: bytes) -> tuple[torch.Tensor, int]:
+    byte_stream = io.BytesIO(file_bytes)
+    waveform, sample_rate = torchaudio.load(byte_stream)
+
+    # Stereo -> Mono
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    # Resample to 16kHz
+    if sample_rate != TARGET_SAMPLE_RATE:
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=TARGET_SAMPLE_RATE)
+        waveform = resampler(waveform)
+        sample_rate = TARGET_SAMPLE_RATE
+
+    return waveform, sample_rate
+
+
+def combine_transcription_and_diarization(transcription: Iterable, diarization: Iterable):
+
+    iter(transcription)
+
+    turns: list[str] = []
+
+    for turn in diarization:
+        current_turn = []
+
+        for _ in range(MAX_WORDS_IN_TURN):
+            word = next(transcription)
+
+            current_turn.append(word)
+
+            if word.end > turn.end:
+                turns.append(" ".join(current_turn))
+                break
+
+    return turns
 
 
 @app.post("/transcribe", response_model=DialogModel)
@@ -73,36 +137,36 @@ def transcribe(audio_file: UploadFile):
     Audio file -> list of lines
     """
     if not audio_file:
-        logger.error("No file!!!")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file!!!")
+        logger.error("No file!")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file!")
 
-    file_bytes = audio_file.file.read()
-
-    byte_stream = io.BytesIO(file_bytes)
-
+    logger.info("Start loading/processing audio")
     try:
-        waveform, sample_rate = torchaudio.load(byte_stream)
+        waveform, sample_rate = preprocess_audio(audio_file.file.read())
     except Exception as e:
-        logger.error("File load error!!!")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File load error!!!") from e
+        logger.error("File processing error!")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File processing error!") from e
+    logger.info("Done loading/processing audio")
 
-    # Stereo -> Mono
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
+    # Call models one by one to reduce peak memory/compute usage
+    logger.info(f"Start transctibing and diarization on {DEVICE}")
+    whisper_waveform = waveform.squeeze().numpy().astype("float32")
+    whisper_output, whisper_info = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True, vad_filter=True)
+    logger.debug(f"Done transcribe: {whisper_info}")
+    diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
+    logger.debug(f"{diarization_output=}")
+    logger.debug("Done diarization")
+    logger.info(f"Done transctibing and diarization on {DEVICE}")
 
-    # Resample to 16kHz
-    if sample_rate != TARGET_SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(sample_rate, TARGET_SAMPLE_RATE)
-        waveform = resampler(waveform)
-        sample_rate = TARGET_SAMPLE_RATE
+    logger.info("Start constructing dialog from models' output")
 
-    output = model({"waveform": waveform, "sample_rate": sample_rate})
+    lines = combine_transcription_and_diarization(whisper_output, diarization_output)
 
-    lines = []
-    for turn, speaker in output.speaker_diarization:
-        line = f"{speaker} speaks between t={turn.start:.3f}s and t={turn.end:.3f}s"
-        lines.append(line)
+    turns = []
+    for (turn, speaker), line in zip(diarization_output.speaker_diarization, lines):
+        turn = DialogTurnModel(speaker=speaker, turn_start=turn.start, turn_end=turn.end, line=line)
+        turns.append(turn)
 
-    logger.info("Success")
+    logger.info(f"Done constructing dialog from models' output, total turns: {len(turns)}")
 
-    return DialogModel(lines=lines)
+    return DialogModel(turns=turns)
