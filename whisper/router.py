@@ -55,7 +55,7 @@ def load_model():
     diarization_checkpoint = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
     global DIARIZATION_MODEL
     logger.info(f"Loading {diarization_checkpoint}")
-    DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, token=HF_TOKEN)
+    DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, use_auth_token=HF_TOKEN)
     DIARIZATION_MODEL.to(torch.device(DEVICE))
     logger.info(f"Loaded {diarization_checkpoint} on {DEVICE}")
 
