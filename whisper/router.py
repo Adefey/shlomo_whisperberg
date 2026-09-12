@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Iterable
+from typing import Sequence, Iterable
 
 import torch
 import torchaudio
@@ -14,7 +14,7 @@ from pyannote.audio import Pipeline
 from pydantic import BaseModel
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
@@ -48,8 +48,6 @@ WHISPER_MODEL: WhisperModel | None = None
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 DEVICE = os.environ.get("DEVICE", "cpu")
-
-MAX_WORDS_IN_TURN = 2048
 
 
 def load_model():
@@ -110,23 +108,32 @@ def preprocess_audio(file_bytes: bytes) -> tuple[torch.Tensor, int]:
     return waveform, sample_rate
 
 
-def combine_transcription_and_diarization(transcription: Iterable, diarization: Iterable):
-
-    iter(transcription)
+def combine_transcription_and_diarization(transcription: Sequence, diarization: Iterable):
 
     turns: list[str] = []
+    next_sequence_start = 0
 
-    for turn in diarization:
+    for turn, _ in diarization:
         current_turn = []
 
-        for _ in range(MAX_WORDS_IN_TURN):
-            word = next(transcription)
+        for i in range(next_sequence_start, len(transcription)):
+            word = transcription[i]
 
-            current_turn.append(word)
+            word_mid_time = (word.start + word.end) / 2
 
-            if word.end > turn.end:
-                turns.append(" ".join(current_turn))
+            logger.warning(f"{word=} {word_mid_time=} {turn.end=} {turn.start=}")
+
+            if word_mid_time <= turn.end and word_mid_time > turn.start:
+                logger.error("APPENDING")
+                current_turn.append(word.word)
+            else:
+                logger.error("BREAK")
                 break
+
+        logger.info(f"LINE= {current_turn=}")
+
+        turns.append(" ".join(current_turn))
+        next_sequence_start = i+1
 
     return turns
 
@@ -149,21 +156,27 @@ def transcribe(audio_file: UploadFile):
     logger.info("Done loading/processing audio")
 
     # Call models one by one to reduce peak memory/compute usage
+
     logger.info(f"Start transctibing and diarization on {DEVICE}")
     whisper_waveform = waveform.squeeze().numpy().astype("float32")
     whisper_output, whisper_info = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True, vad_filter=True)
-    logger.debug(f"Done transcribe: {whisper_info}")
+    words = []
+    for segment in whisper_output:
+        for word in segment.words:
+            words.append(word)
+    logger.debug(f"Done transcribe: {words=}")
+
     diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
-    logger.debug(f"{diarization_output=}")
-    logger.debug("Done diarization")
+    diarization = list(diarization_output.speaker_diarization)
+    logger.debug(f"Done diarization: {diarization=}")
     logger.info(f"Done transctibing and diarization on {DEVICE}")
 
     logger.info("Start constructing dialog from models' output")
-
-    lines = combine_transcription_and_diarization(whisper_output, diarization_output)
+    lines = combine_transcription_and_diarization(words, diarization)
+    logger.info(f"Done constructing dialog from models' output: {lines}")
 
     turns = []
-    for (turn, speaker), line in zip(diarization_output.speaker_diarization, lines):
+    for (turn, speaker), line in zip(diarization, lines, strict=True):
         turn = DialogTurnModel(speaker=speaker, turn_start=turn.start, turn_end=turn.end, line=line)
         turns.append(turn)
 
