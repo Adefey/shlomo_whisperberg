@@ -1,0 +1,13 @@
+services:
+
+  whisper:
+    build:
+      context: whisper
+      dockerfile: Dockerfile
+    ports:
+      - "4321:4321"
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    env_file:
+      - .env
