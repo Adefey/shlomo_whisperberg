@@ -4,7 +4,6 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Sequence, Iterable
 
 import torch
 import torchaudio
@@ -18,7 +17,9 @@ logging.basicConfig(
     format="[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        logging.FileHandler(filename=f'logs/embedding_service_{datetime.now().strftime("%y_%m_%d_%H-%M-%S")}.log'),
+        logging.FileHandler(
+            filename=f'logs/embedding_service_{datetime.now().strftime("%y_%m_%d_%H-%M-%S")}.log'
+        ),
         logging.StreamHandler(stream=sys.stdout),
     ],
 )
@@ -51,7 +52,9 @@ DEVICE = os.environ.get("DEVICE", "cpu")
 
 
 def load_model():
-    diarization_checkpoint = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
+    diarization_checkpoint = os.environ.get(
+        "DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
+    )
     global DIARIZATION_MODEL
     logger.info(f"Loading {diarization_checkpoint} with {HF_TOKEN[:8]=}")
     DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, token=HF_TOKEN)
@@ -101,39 +104,43 @@ def preprocess_audio(file_bytes: bytes) -> tuple[torch.Tensor, int]:
 
     # Resample to 16kHz
     if sample_rate != TARGET_SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=TARGET_SAMPLE_RATE)
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=sample_rate, new_freq=TARGET_SAMPLE_RATE
+        )
         waveform = resampler(waveform)
         sample_rate = TARGET_SAMPLE_RATE
 
     return waveform, sample_rate
 
 
-def combine_transcription_and_diarization(transcription: Sequence, diarization: Iterable):
+def combine_transcription_and_diarization(transcription: list, diarization: list):
 
-    turns: list[str] = []
-    next_sequence_start = 0
+    if not diarization:
+        return []
 
-    for turn, _ in diarization:
-        current_turn = []
+    # diarization object contains immutable objects, need to convert to list of lists
+    diarization = [[turn.start, turn.end] for turn, _ in diarization]
+    # precalc - allocate full timeline with intervals
+    # Guarantee start from 0 even if actual line does not start from 0
+    diarization[0][0] = 0.0
+    for i in range(len(diarization)):
+        if i > 0:
+            diarization[i][0] = diarization[i - 1][1]
+        if i < len(diarization) - 1:
+            diarization[i][1] = (diarization[i][1] + diarization[i + 1][0]) / 2
 
-        for i in range(next_sequence_start, len(transcription)):
-            word = transcription[i]
+    # Guarantee last turn contains all the words
+    diarization[-1][1] = 9999999.0
 
-            word_mid_time = (word.start + word.end) / 2
+    turns = [[] for _ in range(len(diarization))]
 
-            logger.warning(f"{word=} {word_mid_time=} {turn.end=} {turn.start=}")
+    for word in transcription:
+        word_mid_time = (word.start + word.end) / 2
+        for i in range(len(diarization)):
+            if word_mid_time >= diarization[i][0] and word_mid_time < diarization[i][1]:
+                turns[i].append(word.word)
 
-            if word_mid_time <= turn.end and word_mid_time > turn.start:
-                logger.error("APPENDING")
-                current_turn.append(word.word)
-            else:
-                logger.error("BREAK")
-                break
-
-        logger.info(f"LINE= {current_turn=}")
-
-        turns.append(" ".join(current_turn))
-        next_sequence_start = i+1
+    turns = [" ".join(turn) for turn in turns]
 
     return turns
 
@@ -152,14 +159,18 @@ def transcribe(audio_file: UploadFile):
         waveform, sample_rate = preprocess_audio(audio_file.file.read())
     except Exception as e:
         logger.error("File processing error!")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File processing error!") from e
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="File processing error!"
+        ) from e
     logger.info("Done loading/processing audio")
 
     # Call models one by one to reduce peak memory/compute usage
 
     logger.info(f"Start transctibing and diarization on {DEVICE}")
     whisper_waveform = waveform.squeeze().numpy().astype("float32")
-    whisper_output, whisper_info = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True, vad_filter=True)
+    whisper_output, whisper_info = WHISPER_MODEL.transcribe(
+        whisper_waveform, word_timestamps=True, vad_filter=True
+    )
     words = []
     for segment in whisper_output:
         for word in segment.words:
