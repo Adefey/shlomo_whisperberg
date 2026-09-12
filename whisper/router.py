@@ -178,7 +178,7 @@ def transcribe(audio_file: UploadFile):
     logger.debug(f"Done transcribe: {words=} {whisper_output['language']=}")
 
     diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
-    diarization = list(diarization_output.exclusive_speaker_diarization)
+    diarization = list(diarization_output.speaker_diarization)
     logger.debug(f"Done diarization: {diarization=}")
     logger.info(f"Done transctibing and diarization on {DEVICE}")
 
