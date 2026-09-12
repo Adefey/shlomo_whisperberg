@@ -6,7 +6,7 @@ WORKDIR /app
 
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
-RUN apt-get -y update && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip
+RUN apt-get -y update && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip python3-dev
 
 RUN python3 -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
 
