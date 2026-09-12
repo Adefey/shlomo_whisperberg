@@ -17,9 +17,7 @@ logging.basicConfig(
     format="[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        logging.FileHandler(
-            filename=f'logs/embedding_service_{datetime.now().strftime("%y_%m_%d_%H-%M-%S")}.log'
-        ),
+        logging.FileHandler(filename=f'logs/embedding_service_{datetime.now().strftime("%y_%m_%d_%H-%M-%S")}.log'),
         logging.StreamHandler(stream=sys.stdout),
     ],
 )
@@ -52,18 +50,16 @@ DEVICE = os.environ.get("DEVICE", "cpu")
 
 
 def load_model():
-    diarization_checkpoint = os.environ.get(
-        "DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
-    )
+    diarization_checkpoint = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
     global DIARIZATION_MODEL
-    logger.info(f"Loading {diarization_checkpoint} with {HF_TOKEN[:8]=}")
+    logger.info(f"Loading {diarization_checkpoint}")
     DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, token=HF_TOKEN)
     DIARIZATION_MODEL.to(torch.device(DEVICE))
     logger.info(f"Loaded {diarization_checkpoint} on {DEVICE}")
 
     whisper_checkpoint = os.environ.get("WHISPER_MODEL", "Systran/faster-whisper-small")
     global WHISPER_MODEL
-    logger.info(f"Loading {whisper_checkpoint} with {HF_TOKEN[:8]=}")
+    logger.info(f"Loading {whisper_checkpoint}")
     WHISPER_MODEL = WhisperModel(whisper_checkpoint, DEVICE)
     logger.info(f"Loaded {whisper_checkpoint} on {DEVICE}")
 
@@ -104,9 +100,7 @@ def preprocess_audio(file_bytes: bytes) -> tuple[torch.Tensor, int]:
 
     # Resample to 16kHz
     if sample_rate != TARGET_SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(
-            orig_freq=sample_rate, new_freq=TARGET_SAMPLE_RATE
-        )
+        resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=TARGET_SAMPLE_RATE)
         waveform = resampler(waveform)
         sample_rate = TARGET_SAMPLE_RATE
 
@@ -130,7 +124,7 @@ def combine_transcription_and_diarization(transcription: list, diarization: list
             diarization[i][1] = (diarization[i][1] + diarization[i + 1][0]) / 2
 
     # Guarantee last turn contains all the words
-    diarization[-1][1] = 9999999.0
+    diarization[-1][1] = float("inf")
 
     turns = [[] for _ in range(len(diarization))]
 
@@ -139,10 +133,16 @@ def combine_transcription_and_diarization(transcription: list, diarization: list
         for i in range(len(diarization)):
             if word_mid_time >= diarization[i][0] and word_mid_time < diarization[i][1]:
                 turns[i].append(word.word)
+                break
 
     turns = [" ".join(turn) for turn in turns]
 
     return turns
+
+
+def normalize_line(line: str) -> str:
+    normalized_line = " ".join(line.split())
+    return normalized_line
 
 
 @app.post("/transcribe", response_model=DialogModel)
@@ -159,18 +159,14 @@ def transcribe(audio_file: UploadFile):
         waveform, sample_rate = preprocess_audio(audio_file.file.read())
     except Exception as e:
         logger.error("File processing error!")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="File processing error!"
-        ) from e
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="File processing error!") from e
     logger.info("Done loading/processing audio")
 
     # Call models one by one to reduce peak memory/compute usage
 
     logger.info(f"Start transctibing and diarization on {DEVICE}")
     whisper_waveform = waveform.squeeze().numpy().astype("float32")
-    whisper_output, whisper_info = WHISPER_MODEL.transcribe(
-        whisper_waveform, word_timestamps=True, vad_filter=True
-    )
+    whisper_output, whisper_info = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True, vad_filter=True)
     words = []
     for segment in whisper_output:
         for word in segment.words:
@@ -178,18 +174,20 @@ def transcribe(audio_file: UploadFile):
     logger.debug(f"Done transcribe: {words=}")
 
     diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
-    diarization = list(diarization_output.speaker_diarization)
+    diarization = list(diarization_output.exclusive_speaker_diarization)
     logger.debug(f"Done diarization: {diarization=}")
     logger.info(f"Done transctibing and diarization on {DEVICE}")
 
     logger.info("Start constructing dialog from models' output")
     lines = combine_transcription_and_diarization(words, diarization)
-    logger.info(f"Done constructing dialog from models' output: {lines}")
+    logger.info(f"Done constructing dialog from models' output")
 
     turns = []
     for (turn, speaker), line in zip(diarization, lines, strict=True):
-        turn = DialogTurnModel(speaker=speaker, turn_start=turn.start, turn_end=turn.end, line=line)
-        turns.append(turn)
+        line = normalize_line(line)
+        if line:
+            turn = DialogTurnModel(speaker=speaker, turn_start=turn.start, turn_end=turn.end, line=line)
+            turns.append(turn)
 
     logger.info(f"Done constructing dialog from models' output, total turns: {len(turns)}")
 
