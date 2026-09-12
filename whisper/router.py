@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from time import time
 from typing import Any
 
 import torch
@@ -28,18 +29,21 @@ logger = logging.getLogger(__name__)
 
 
 class DialogTurnModel(BaseModel):
-    speaker: str
+    label: str
     turn_start: float
     turn_end: float
-    line: str = ""
+    text: str = ""
 
 
 class DialogModel(BaseModel):
     """
-    Dialog contains list of lines
+    Dialog contains list of turns with speaker label, start and end
+    time (seconds) and text. Also time for transcription and diarization
     """
 
     turns: list[DialogTurnModel]
+    transcription_time: float
+    diarization_time: float
 
 
 TARGET_SAMPLE_RATE = 16000
@@ -54,19 +58,19 @@ DIARIZATION_DEVICE = os.environ.get("DIARIZATION_DEVICE", "cpu")
 
 
 def load_model():
-    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "openai/whisper-small")
+    whisper_checkpoint = os.environ.get("WHISPER_MODEL", "small")
     global WHISPER_MODEL
     logger.info(f"Loading {whisper_checkpoint}")
     WHISPER_MODEL = whisper.load_model(whisper_checkpoint, WHISPER_DEVICE)
-    DIARIZATION_MODEL.segmentation_batch_size = 8
-    DIARIZATION_MODEL.embedding_batch_size = 8
     logger.info(f"Loaded {whisper_checkpoint} on {WHISPER_DEVICE}")
 
-    diarization_checkpoint = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
+    diarization_checkpoint = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
     global DIARIZATION_MODEL
     logger.info(f"Loading {diarization_checkpoint}")
     DIARIZATION_MODEL = Pipeline.from_pretrained(diarization_checkpoint, use_auth_token=HF_TOKEN)
     DIARIZATION_MODEL.to(torch.device(DIARIZATION_DEVICE))
+    DIARIZATION_MODEL.segmentation_batch_size = 8
+    DIARIZATION_MODEL.embedding_batch_size = 8
     logger.info(f"Loaded {diarization_checkpoint} on {DIARIZATION_DEVICE}")
 
 
@@ -171,7 +175,8 @@ def transcribe(audio_file: UploadFile):
     # Call models one by one to reduce peak memory/compute usage
 
     logger.info(f"Start transctibing and diarization on {WHISPER_DEVICE} + {DIARIZATION_DEVICE}")
-    whisper_waveform = waveform.squeeze().numpy().astype("float32")
+    transcription_time_start = time()
+    whisper_waveform = waveform.squeeze(0).numpy().astype("float32")
     whisper_output = WHISPER_MODEL.transcribe(whisper_waveform, word_timestamps=True)
 
     words = []
@@ -179,20 +184,23 @@ def transcribe(audio_file: UploadFile):
         if "words" in segment:  # проверка, что слова есть
             for word in segment["words"]:
                 words.append(word)
+    transcription_time = time() - transcription_time_start
     logger.debug(f"Done transcribe: {words=} {whisper_output['language']=}")
 
     # Cleanup
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and WHISPER_DEVICE == "cuda":
         torch.cuda.empty_cache()
 
     logger.info("Transcription is ready. Diarization in progress...")
 
+    diarization_time_start = time()
     diarization_output = DIARIZATION_MODEL({"waveform": waveform, "sample_rate": sample_rate})
     diarization = [(segment, label) for segment, _, label in diarization_output.itertracks(yield_label=True)]
+    diarization_time = time() - diarization_time_start
     logger.debug(f"Done diarization: {diarization=}")
 
     # Cleanup
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and DIARIZATION_DEVICE == "cuda":
         torch.cuda.empty_cache()
 
     logger.info(f"Done transctibing and diarization on {WHISPER_DEVICE} + {DIARIZATION_DEVICE}")
@@ -205,7 +213,7 @@ def transcribe(audio_file: UploadFile):
     for (turn, speaker), line in zip(diarization, lines, strict=True):
         line = normalize_line(line)
         if line:
-            turn = DialogTurnModel(speaker=speaker, turn_start=turn.start, turn_end=turn.end, line=line)
+            turn = DialogTurnModel(label=speaker, turn_start=turn.start, turn_end=turn.end, text=line)
             turns.append(turn)
 
     logger.info(f"Done constructing dialog from models' output, total turns: {len(turns)}")
@@ -214,4 +222,4 @@ def transcribe(audio_file: UploadFile):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return DialogModel(turns=turns)
+    return DialogModel(turns=turns, transcription_time=transcription_time, diarization_time=diarization_time)
